@@ -116,7 +116,9 @@ disconnect your speakers without asking, so it tells you instead.
 
 ## Tools
 
-Built by `./build-app.sh` into `bin/`, or install the whole set with `./install.sh`.
+Shipped inside `Preroll.app`, and put on your PATH by the Homebrew cask. A local
+`./build.sh` puts them in `bin/` instead; `./install.sh` installs the whole set
+along with a LaunchAgent that runs the keep-alive without the menu bar app.
 
 | tool | purpose |
 |---|---|
