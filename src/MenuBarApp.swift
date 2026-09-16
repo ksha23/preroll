@@ -124,7 +124,7 @@ enum Pref {
         try? p.run(); p.waitUntilExit(); return p.terminationStatus
     }
     /// AirPlayXPCHelper runs as ROOT, so kCFPreferencesCurrentUser resolves to
-    /// /var/root/Library/Preferences — which OUTRANKS /Library/Preferences in the
+    /// /var/root/Library/Preferences, which OUTRANKS /Library/Preferences in the
     /// search list. Writing only the system domain is silently overridden by any
     /// value sitting in root's own domain. Verified: a freshly started helper read
     /// 350 while /Library/Preferences held 325.
@@ -528,7 +528,7 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if b.image == nil && b.title.isEmpty { b.title = "AP" }
         b.alphaValue = model.masterOn ? 1.0 : 0.55
         b.toolTip = model.masterOn
-            ? "Preroll — active" : "Preroll — inactive"
+            ? "Preroll: active" : "Preroll: inactive"
     }
 
     /// Closing the panel discards an unapplied edit, so reopening always shows

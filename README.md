@@ -15,16 +15,27 @@ Apple TV 4K.
 
 ## Install
 
-Requires Xcode command line tools. Nothing is signed and nothing is downloaded.
+    brew install --cask --no-quarantine ksha23/tap/preroll
+    open -a Preroll
 
-    git clone https://github.com/ksha23/preroll-latency-fix.git
-    cd preroll-latency-fix
+`--no-quarantine` is needed because the app is not notarized yet: without it
+macOS refuses to open anything downloaded that Apple has not seen.
+
+Or build it yourself, which needs the Xcode command line tools and downloads
+nothing:
+
+    git clone https://github.com/ksha23/preroll.git
+    cd preroll
     ./build-app.sh
     cp -R "Preroll.app" /Applications/
     open -a Preroll
 
 A wave icon appears in the menu bar showing the current latency. There is no Dock
 icon; it is a menu bar app only.
+
+The measurement tools live inside the bundle. Homebrew puts `preroll-latency`
+and `aplat` on your PATH; a local build reaches them at
+`Preroll.app/Contents/MacOS/`.
 
 ## Use
 

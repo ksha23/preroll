@@ -1,0 +1,113 @@
+name: Release
+
+# Tag a version and this builds the app, publishes it, and points the Homebrew
+# tap at the new download:
+#
+#   git tag v1.0.1 && git push origin v1.0.1
+#
+# The signing and notarization steps run only once the secrets below exist, so
+# the same workflow serves an unsigned build today and a notarized one later:
+#
+#   MACOS_CERT_P12        Developer ID Application certificate, base64 of the .p12
+#   MACOS_CERT_PASSWORD   password used when exporting that .p12
+#   AC_APPLE_ID           Apple ID of the developer account
+#   AC_TEAM_ID            10 character team id
+#   AC_PASSWORD           app-specific password for that Apple ID
+#   HOMEBREW_TAP_TOKEN    token that may push to the tap repository
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to build, without the leading v
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      TAP_REPO: ksha23/homebrew-tap
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the version
+        run: |
+          V="${{ github.event.inputs.version }}"
+          [ -n "$V" ] || V="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+
+      - name: Import the signing certificate
+        if: env.MACOS_CERT_P12 != ''
+        env:
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN=$RUNNER_TEMP/build.keychain
+          PASSWORD=$(uuidgen)
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          ID=$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+          [ -n "$ID" ] || { echo "no Developer ID Application identity in the certificate"; exit 1; }
+          echo "CODESIGN_ID=$ID" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: ./build-app.sh "$VERSION"
+
+      - name: Notarize and staple
+        if: env.CODESIGN_ID != ''
+        env:
+          AC_APPLE_ID: ${{ secrets.AC_APPLE_ID }}
+          AC_TEAM_ID: ${{ secrets.AC_TEAM_ID }}
+          AC_PASSWORD: ${{ secrets.AC_PASSWORD }}
+        run: |
+          ditto -c -k --keepParent Preroll.app "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$AC_APPLE_ID" --team-id "$AC_TEAM_ID" --password "$AC_PASSWORD" --wait
+          # Stapling the ticket means the app opens even on a machine that
+          # cannot reach Apple to check
+          xcrun stapler staple Preroll.app
+          spctl --assess --type execute -vv Preroll.app
+
+      - name: Package
+        run: |
+          ditto -c -k --keepParent Preroll.app "Preroll-$VERSION.zip"
+          echo "SHA256=$(shasum -a 256 "Preroll-$VERSION.zip" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          shasum -a 256 "Preroll-$VERSION.zip"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTE="Unsigned build: install with \`brew install --cask --no-quarantine ksha23/tap/preroll\`, or remove the quarantine flag by hand."
+          [ -n "$CODESIGN_ID" ] && NOTE="Signed and notarized."
+          gh release create "v$VERSION" "Preroll-$VERSION.zip" \
+            --title "Preroll $VERSION" \
+            --notes "$NOTE
+
+          sha256: \`$SHA256\`" \
+            || gh release upload "v$VERSION" "Preroll-$VERSION.zip" --clobber
+
+      - name: Point the Homebrew tap at this version
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        run: |
+          git clone "https://x-access-token:$HOMEBREW_TAP_TOKEN@github.com/$TAP_REPO" "$RUNNER_TEMP/tap"
+          CASK="$RUNNER_TEMP/tap/Casks/preroll.rb"
+          sed -i '' -e "s|^  version \".*\"|  version \"$VERSION\"|" \
+                    -e "s|^  sha256 \".*\"|  sha256 \"$SHA256\"|" "$CASK"
+          cd "$RUNNER_TEMP/tap"
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git commit -am "preroll $VERSION" && git push
