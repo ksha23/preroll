@@ -91,7 +91,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          NOTE="Unsigned build: install with \`brew install --cask --no-quarantine ksha23/tap/preroll\`, or remove the quarantine flag by hand."
+          NOTE="Unsigned build: macOS refuses the first launch, so allow it in System Settings > Privacy & Security, or build from source."
           [ -n "$CODESIGN_ID" ] && NOTE="Signed and notarized."
           gh release create "v$VERSION" "Preroll-$VERSION.zip" \
             --title "Preroll $VERSION" \

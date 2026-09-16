@@ -15,14 +15,9 @@ Apple TV 4K.
 
 ## Install
 
-    brew install --cask --no-quarantine ksha23/tap/preroll
-    open -a Preroll
-
-`--no-quarantine` is needed because the app is not notarized yet: without it
-macOS refuses to open anything downloaded that Apple has not seen.
-
-Or build it yourself, which needs the Xcode command line tools and downloads
-nothing:
+Build it yourself. This needs the Xcode command line tools, downloads nothing,
+and is the path with no Gatekeeper prompt, because code you compiled is not
+quarantined:
 
     git clone https://github.com/ksha23/preroll.git
     cd preroll
@@ -32,6 +27,14 @@ nothing:
 
 A wave icon appears in the menu bar showing the current latency. There is no Dock
 icon; it is a menu bar app only.
+
+Or with Homebrew:
+
+    brew install --cask ksha23/tap/preroll
+
+The app is not notarized yet, so the first launch is refused: open **System
+Settings > Privacy & Security**, and press **Open Anyway**. Homebrew removed
+its `--no-quarantine` option in version 5.
 
 The measurement tools live inside the bundle. Homebrew puts `preroll-latency`
 and `aplat` on your PATH; a local build reaches them at
