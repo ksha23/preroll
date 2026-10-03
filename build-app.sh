@@ -71,6 +71,12 @@ for t in adump:preroll-latency aplat:aplat apstart:apstart keepalive:preroll-kee
   build_universal "src/$SRC.swift" "$APP/Contents/MacOS/$OUT"
 done
 
+# The optional root helper. The app copies these into root-owned locations when
+# the user installs it; root never runs anything from inside the bundle.
+cp helper/preroll-helper.sh helper/com.ksha23.preroll.helper.plist "$APP/Contents/Resources/"
+cp helper/install.sh   "$APP/Contents/Resources/helper-install.sh"
+cp helper/uninstall.sh "$APP/Contents/Resources/helper-uninstall.sh"
+
 rm -rf build
 
 if [ -n "$CODESIGN_ID" ]; then

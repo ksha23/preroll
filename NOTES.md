@@ -55,12 +55,28 @@ domain alongside it only so it can read the value back for display.
 
 ### When it takes effect
 
-The helper reads the preference when it constructs an audio engine, which happens
-when an AirPlay route is established. So:
+The helper builds one realtime engine for system audio, on the first AirPlay route
+after it starts, and keeps it for its whole life. Every later route change resumes
+that same engine at the latency it was created with. The helper is started at boot
+and lives until killed. So:
 
-    route change (deselect/reselect)  ->  picks up the new value
-    suspend/resume (play/pause)       ->  does not
-    killall AirPlayXPCHelper          ->  works, but drops the route
+    route change (deselect/reselect)  ->  resumes the old engine, old latency
+    suspend/resume (play/pause)       ->  same engine, old latency
+    killall AirPlayXPCHelper          ->  next route builds a new engine; drops the route
+
+It is not a preference cache. With both domains at 1000, one helper pid logged:
+
+    Overriding audio latency: 1000 ms
+    RTAE ['HLA'-0x01CE] Resuming endpoint stream with latency 0.400000 seconds.
+
+The value was re-read (other engines were built at 1000), but the system-audio
+engine 0x01CE, created hours earlier at 400 ms, was resumed on every re-select, and
+the device kept reporting 17640 frames. After a restart:
+
+    RTAE ['HLA'-0xF36D] Resuming endpoint stream with latency 1.000000 seconds.
+
+A route change alone looks like it works only when the engine's latency happens to
+equal what is on disk, so a test of it must make the two differ.
 
 ### Bounds
 
@@ -194,6 +210,63 @@ model, and it is unnecessary: the preference surface is reachable at runtime.
 shipping a bug fix depend on keeping that membership current. A `NOPASSWD` sudoers
 rule would remove the prompt but is a standing root grant. Neither is used.
 
-The app writes one root-owned preference file per change, through the standard
-macOS authorization dialog, and does nothing else privileged. The keep-alive needs
-no privileges at all.
+Per change, the app writes the root-owned preference and restarts
+`AirPlayXPCHelper`, both in one standard macOS authorization dialog, and does
+nothing else privileged. The keep-alive needs no privileges at all.
+
+### The optional helper
+
+Automatic per-speaker switching cannot put a password dialog in front of every
+speaker change, so there is an opt-in helper, installed with one prompt. It is a
+standing root service, so it is kept as narrow as possible:
+
+    /Library/LaunchDaemons/com.ksha23.preroll.helper.plist     root:wheel 644
+    /Library/PrivilegedHelperTools/com.ksha23.preroll.helper   root:wheel 755, the script
+    /Library/Application Support/Preroll/                     root:wheel 755
+        request    owned by the installing user, 600: the only thing they can write
+        done       root, 644: the last request handled, for the app to confirm
+
+- launchd starts the script when `request` changes (`WatchPaths`). Nothing runs
+  otherwise.
+- The request is one line, `<sequence> <ms|off>`, read with a 64-byte cap. The
+  sequence must be digits; the value must be `off` or an integer from 100 to 4000
+  with no leading zero. Anything else is ignored, and the only thing that reaches
+  a command is that validated integer.
+- The directory is root's, so the user owns only the file's contents: they cannot
+  swap it for a link to something else.
+- Root only runs copies in root-owned locations. The app bundle is writable by
+  its user, so the install step copies the script out of it and never points
+  launchd at it.
+- What a user with write access to `request` can do: set the AirPlay latency and
+  restart `AirPlayXPCHelper`, as often as they like. That is the whole surface.
+
+The app writes a fixed 64-byte record at offset 0 in one `pwrite`, so the script
+never reads half a line, and then waits for `done` to show its sequence. Measured
+through launchd with `ThrottleInterval` 1: five back-to-back requests each
+confirmed in 1.1 to 1.25 s.
+
+## Identifying the speaker
+
+CoreAudio calls every AirPlay route "AirPlay". Its UID is minted when
+`AirPlayXPCHelper` starts and then reused for whatever is picked next: one UID
+carried Bedroom, Desk Stereo Pair and Back Stereo Pair in turn. So neither names
+a speaker.
+
+`AVOutputContext`'s system-wide context would, and could even re-route, but it
+returns nil without an Apple entitlement.
+
+The system log has it. `audioaccessoryd` logs every route change with the UID
+and the name the user picked:
+
+    Received manual route change uid 4c779229-...-432418906370041-Audio type output
+      name Bedroom source ControlCenter ...
+
+The app streams that line with `log stream`, which needs no privileges, and at
+launch looks back for the route already up: one hour takes about 2 s, a week
+about 17 s. The `AirPlayXPCHelper` endpoint lines are no good for this: a stereo
+pair shows up as its two halves, parented to the pair's cluster rather than to the
+system-audio aggregate.
+
+The engine is built before that line is logged (engine at 01:06:07.211, name at
+01:06:08.265), so the name always arrives too late to set the latency of the
+route it names. That is why a switch costs one extra pick.

@@ -23,13 +23,15 @@ enum CA {
         AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &z, &d)
         return d
     }
-    static func name(_ d: AudioDeviceID) -> String {
-        var a = addr(kAudioObjectPropertyName)
-        guard AudioObjectHasProperty(d, &a) else { return "No output" }
+    static func string(_ d: AudioDeviceID, _ sel: AudioObjectPropertySelector) -> String? {
+        var a = addr(sel)
+        guard AudioObjectHasProperty(d, &a) else { return nil }
         var s: CFString? = nil; var z = UInt32(MemoryLayout<CFString?>.size)
         let r = withUnsafeMutablePointer(to: &s) { AudioObjectGetPropertyData(d, &a, 0, nil, &z, $0) }
-        return r == noErr ? (s as String? ?? "No output") : "No output"
+        return r == noErr ? s as String? : nil
     }
+    static func name(_ d: AudioDeviceID) -> String { string(d, kAudioObjectPropertyName) ?? "No output" }
+    static func uid(_ d: AudioDeviceID) -> String { string(d, kAudioDevicePropertyDeviceUID) ?? "" }
     static func u32(_ d: AudioObjectID, _ s: AudioObjectPropertySelector,
                     _ sc: AudioObjectPropertyScope) -> UInt32 {
         var a = addr(s, sc)
@@ -118,10 +120,20 @@ enum Pref {
         guard let d = NSDictionary(contentsOfFile: systemPlist + ".plist") else { return nil }
         return (d[kKey] as? NSNumber)?.intValue
     }
-    @discardableResult
-    static func sh(_ c: String) -> Int32 {
-        let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/sh"); p.arguments = ["-c", c]
-        try? p.run(); p.waitUntilExit(); return p.terminationStatus
+    /// Single-quotes a string for /bin/sh.
+    static func shq(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+
+    /// Runs one shell command as root through the standard macOS authorization
+    /// dialog. Returns nil on success, else a message; a cancel says so.
+    static func admin(_ cmd: String) -> String? {
+        let lit = cmd.replacingOccurrences(of: "\\", with: "\\\\")
+                     .replacingOccurrences(of: "\"", with: "\\\"")
+        var err: NSDictionary?
+        NSAppleScript(source: "do shell script \"\(lit)\" with administrator privileges")?
+            .executeAndReturnError(&err)
+        guard let err else { return nil }
+        if (err["NSAppleScriptErrorNumber"] as? Int) == -128 { return "Cancelled." }
+        return (err["NSAppleScriptErrorMessage"] as? String) ?? "Authorization failed."
     }
     /// AirPlayXPCHelper runs as ROOT, so kCFPreferencesCurrentUser resolves to
     /// /var/root/Library/Preferences, which OUTRANKS /Library/Preferences in the
@@ -133,11 +145,18 @@ enum Pref {
     /// helper actually reads, and the system domain because this app runs as the
     /// console user and can read it back for display.
     ///
-    /// Deliberately does NOT restart the helper or touch the audio route. Changing
-    /// the user's speakers without asking is not this app's business; it reports
-    /// what is needed and lets the user choose when to reconnect.
+    /// The helper restart is NOT optional. The helper builds ONE realtime engine for
+    /// system audio on the first route after it starts, and every later route change
+    /// resumes that engine at the latency it was created with. The preference itself
+    /// is re-read, but that engine is never rebuilt. Verified in the log: with both
+    /// domains at 1000, pid 393 logged "Overriding audio latency: 1000 ms", yet every
+    /// re-select logged "Resuming endpoint stream with latency 0.400000 seconds" on
+    /// the same engine, RTAE 'HLA'-0x01CE. The restarted helper built a new engine at
+    /// 1.000000 s.
+    ///
+    /// Restarting drops the AirPlay route, so the speakers must be re-selected.
     static func apply(_ ms: Int?) -> String? {
-        let cmd: String
+        var cmd: String
         if let ms {
             cmd = "/usr/bin/defaults write \(kDomain) \(kKey) -int \(ms); "
                 + "/usr/bin/defaults write \(systemPlist) \(kKey) -int \(ms)"
@@ -145,14 +164,176 @@ enum Pref {
             cmd = "/usr/bin/defaults delete \(kDomain) \(kKey) 2>/dev/null || true; "
                 + "/usr/bin/defaults delete \(systemPlist) \(kKey) 2>/dev/null || true"
         }
-        var err: NSDictionary?
-        NSAppleScript(source: "do shell script \"\(cmd)\" with administrator privileges")?
-            .executeAndReturnError(&err)
-        if let err {
-            let m = (err["NSAppleScriptErrorMessage"] as? String) ?? "authorization failed"
-            return m.contains("-128") ? nil : m          // -128 == user cancelled
+        cmd += "; /usr/bin/killall AirPlayXPCHelper 2>/dev/null || true"
+        return admin(cmd)
+    }
+}
+
+// ------------------------------------------------------------------ privileged helper
+
+/// Optional root helper that applies a latency with no password prompt, which is
+/// what lets Preroll switch to each speaker's own latency by itself. It is a short
+/// shell script that launchd runs whenever one request file changes; see helper/.
+/// Without it, every change goes through Pref.apply and its admin prompt.
+enum Helper {
+    static let label   = "com.ksha23.preroll.helper"
+    static let dir     = "/Library/Application Support/Preroll"
+    static let request = dir + "/request"
+    static let done    = dir + "/done"
+    static let script  = "/Library/PrivilegedHelperTools/" + label
+    static var resources: String { Bundle.main.resourcePath ?? "" }
+
+    /// Installed, and installed for THIS user: only they can write the request file.
+    static var installed: Bool {
+        FileManager.default.fileExists(atPath: "/Library/LaunchDaemons/\(label).plist")
+            && access(request, W_OK) == 0
+    }
+    /// The installed script is not the one this build ships.
+    static var outdated: Bool {
+        installed && !FileManager.default.contentsEqual(atPath: script,
+                                                        andPath: resources + "/preroll-helper.sh")
+    }
+    static func install() -> String? {
+        let src = resources + "/helper-install.sh"
+        guard FileManager.default.fileExists(atPath: src) else {
+            return "This build does not include the helper."
         }
-        return nil
+        return Pref.admin("/bin/sh \(Pref.shq(src)) \(getuid()) \(Pref.shq(resources))")
+    }
+    static func uninstall() -> String? {
+        Pref.admin("/bin/sh \(Pref.shq(resources + "/helper-uninstall.sh"))")
+    }
+
+    /// Hands one value to the helper and waits for it to confirm. Blocks, so call it
+    /// off the main thread. The record is a fixed 64 bytes written at offset 0 in a
+    /// single call, so the helper never reads half a line, and it is rewritten if
+    /// launchd missed the first change.
+    static func send(_ ms: Int?) -> String? {
+        let seq = String(UInt64(Date().timeIntervalSince1970 * 1000))
+        var rec = Array("\(seq) \(ms.map(String.init) ?? "off")\n".utf8)
+        rec += Array(repeating: UInt8(ascii: " "), count: max(0, 64 - rec.count))
+        for _ in 0..<3 {
+            let fd = open(request, O_WRONLY)
+            guard fd >= 0 else { return "The helper's request file is not writable. Reinstall the helper." }
+            let n = rec.withUnsafeBytes { pwrite(fd, $0.baseAddress, $0.count, 0) }
+            close(fd)
+            guard n == rec.count else { return "Could not write to the helper." }
+            for _ in 0..<15 {
+                usleep(100_000)
+                let d = try? String(contentsOfFile: done, encoding: .utf8)
+                if d?.trimmingCharacters(in: .whitespacesAndNewlines) == seq { return nil }
+            }
+        }
+        return "The helper did not respond. Try reinstalling it."
+    }
+}
+
+// ------------------------------------------------------------------ speaker names
+
+/// CoreAudio names every AirPlay route just "AirPlay", and its UID is minted per
+/// AirPlayXPCHelper session and then reused for whatever speakers are picked next,
+/// so neither identifies a speaker. The name the user picked is only in the system
+/// log, where audioaccessoryd writes one line per route change:
+///
+///     Received manual route change uid <UID> type output name Bedroom source ControlCenter ...
+///
+/// That pairs the UID with the user-facing name, stereo pairs included ("Desk
+/// Stereo Pair"). Reading the log needs no privileges.
+final class RouteNames {
+    private(set) var byUID: [String: String] = [:]
+    /// UIDs learned live; always newer than anything the backfill finds.
+    private var live: Set<String> = []
+    var onLive: ((String) -> Void)?
+    var onBackfill: (() -> Void)?
+    private var stream: Process?
+    private var buffer = Data()
+    private var stopped = false
+
+    private static let predicate =
+        "process == \"audioaccessoryd\" AND eventMessage CONTAINS \"route change uid\""
+    private static let re = try! NSRegularExpression(
+        pattern: "route change uid (\\S+) type \\S+ name (.+?) source ")
+
+    static func parse(_ line: Data) -> (uid: String, name: String)? {
+        guard let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+              let m = o["eventMessage"] as? String,
+              let r = re.firstMatch(in: m, range: NSRange(m.startIndex..., in: m)),
+              let u = Range(r.range(at: 1), in: m), let n = Range(r.range(at: 2), in: m)
+        else { return nil }
+        return (String(m[u]), String(m[n]))
+    }
+
+    /// Streams new route changes, and looks back for the one that named the route
+    /// already up at launch: the last hour first (~2 s), then a week (~15 s) only if
+    /// that route was older.
+    func start(currentUID: @escaping () -> String) {
+        // An instance that was killed rather than quit leaves its `log stream`
+        // running, reparented to launchd. End any such leftover first.
+        let reap = Process()
+        reap.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        reap.arguments = ["-P", "1", "-f", "--", "--style ndjson --predicate " + Self.predicate]
+        try? reap.run(); reap.waitUntilExit()
+        startStream()
+        backfill("1h") { [weak self] in
+            guard let self else { return }
+            let u = currentUID()
+            if !u.isEmpty && self.byUID[u] == nil { self.backfill("7d") {} }
+        }
+    }
+
+    func stop() { stopped = true; stream?.terminate() }
+
+    private func startStream() {
+        guard !stopped else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/log")
+        p.arguments = ["stream", "--style", "ndjson", "--predicate", Self.predicate]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let d = h.availableData
+            if d.isEmpty { h.readabilityHandler = nil; return }
+            DispatchQueue.main.async { self?.consume(d) }
+        }
+        p.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self?.startStream() }
+        }
+        do { try p.run(); stream = p } catch { stream = nil }
+    }
+
+    private func consume(_ d: Data) {
+        buffer.append(d)
+        while let nl = buffer.firstIndex(of: 0x0A) {
+            let line = Data(buffer[buffer.startIndex..<nl])
+            buffer.removeSubrange(buffer.startIndex...nl)
+            if let (u, n) = Self.parse(line) { byUID[u] = n; live.insert(u); onLive?(u) }
+        }
+    }
+
+    private func backfill(_ window: String, then: @escaping () -> Void) {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/log")
+            p.arguments = ["show", "--last", window, "--style", "ndjson", "--predicate", Self.predicate]
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = FileHandle.nullDevice
+            var found: [String: String] = [:]
+            if (try? p.run()) != nil {
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                p.waitUntilExit()
+                for line in data.split(separator: 0x0A) {       // oldest first, so the last wins
+                    if let (u, n) = Self.parse(Data(line)) { found[u] = n }
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                for (u, n) in found where !self.live.contains(u) { self.byUID[u] = n }
+                self.onBackfill?()
+                then()
+            }
+        }
     }
 }
 
@@ -179,19 +360,50 @@ final class Model: ObservableObject {
     /// reflects that nothing changed, instead of showing a state that is not true.
     @Published var masterOn = false
 
-    var savedLatency: Int { UserDefaults.standard.object(forKey: "savedLatency") as? Int ?? 350 }
+    // ---- speakers
+
+    let names = RouteNames()
+    var deviceUID = ""
+    /// The speaker the current AirPlay route was picked as, e.g. "Bedroom" or "Desk
+    /// Stereo Pair". nil when the output is not AirPlay or its name is not known yet.
+    @Published var routeName: String?
+    /// Each speaker's own latency, keyed by the name it was picked as. A speaker is
+    /// added the first time it is picked, at the latency it plays at.
+    @Published var profiles: [String: Int] =
+        UserDefaults.standard.dictionary(forKey: "profiles") as? [String: Int] ?? [:] {
+        didSet { UserDefaults.standard.set(profiles, forKey: "profiles") }
+    }
+    /// Applied when no saved speaker says otherwise: turning on from Inactive, or
+    /// setting a latency with no AirPlay route up.
+    var fallbackLatency: Int {
+        get { UserDefaults.standard.object(forKey: "savedLatency") as? Int ?? 350 }
+        set { UserDefaults.standard.set(newValue, forKey: "savedLatency") }
+    }
+    @Published var autoSwitch = UserDefaults.standard.object(forKey: "autoSwitch") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(autoSwitch, forKey: "autoSwitch") }
+    }
+    @Published var helperInstalled = false
+    @Published var helperOutdated = false
+    /// After a restart dropped the route: the speaker to pick again, shown in the
+    /// menu bar until that route is live.
+    @Published var reselect: String?
+    private var reselectSince = Date.distantPast
+    private var lastSwitch: (ms: Int, at: Date)?
+    /// A speaker removed from the list while it was playing. Not re-added until it
+    /// is picked again, or × would appear to do nothing.
+    private var forgotten: String?
+
+    /// The current speaker's saved latency, if it has one.
+    var saved: Int? { routeName.flatMap { profiles[$0] } }
+
+    /// What the current route should run: the speaker's saved latency, else what
+    /// was last applied. So a speaker not saved yet, or whose name is not known yet
+    /// (the look-back at launch can take ~15 s), is never switched on a guess.
+    var wanted: Int { saved ?? Pref.override ?? fallbackLatency }
 
     /// Master switch: ALL effects. Off removes the latency override AND stops the
-    /// keep-alive. On restores the last latency used and resumes the keep-alive.
-    /// Removing the override is a root-owned preference write, so this prompts.
-    func setMaster(_ on: Bool) {
-        if on {
-            apply(Int(target))
-        } else {
-            if let cur = Pref.override { UserDefaults.standard.set(cur, forKey: "savedLatency") }
-            apply(nil)
-        }
-    }
+    /// keep-alive. On applies what the current route should run and resumes it.
+    func setMaster(_ on: Bool) { apply(on ? wanted : nil) }
 
     @Published var keepEnabled = UserDefaults.standard.object(forKey: "keepEnabled") as? Bool ?? true {
         didSet { UserDefaults.standard.set(keepEnabled, forKey: "keepEnabled"); sync() }
@@ -205,29 +417,44 @@ final class Model: ObservableObject {
 
     let keep = KeepAlive()
     var keepRunning: Bool { keep.isRunning }
-    /// The override is live only when the stream latency in frames matches the
-    /// requested milliseconds exactly. 350 ms at 44100 Hz == 15435 frames.
-    var expectedFrames: UInt32? {
-        guard let o = Pref.override, sampleRate > 0 else { return nil }
-        return UInt32((Double(o) / 1000.0 * sampleRate).rounded())
+    /// A latency is live only when the stream latency in frames matches it exactly.
+    /// 350 ms at 44100 Hz == 15435 frames.
+    func frames(_ ms: Int) -> UInt32? {
+        sampleRate > 0 ? UInt32((Double(ms) / 1000.0 * sampleRate).rounded()) : nil
     }
+    /// The latency the helper is actually running, from the stream frames.
+    var streamMs: Int { sampleRate > 0 ? Int((Double(streamFrames) / sampleRate * 1000).rounded()) : 0 }
 
     func refresh() {
         let d = CA.defaultOutput()
         let l = CA.latency(d)
         deviceName   = CA.name(d)
+        deviceUID    = CA.uid(d)
         isAirPlay    = CA.transport(d) == kAirPlay
+        routeName    = isAirPlay ? names.byUID[deviceUID] : nil
         sampleRate   = l.sr
         streamFrames = l.stream
         latencyMs    = l.sr > 0 ? Double(l.total) / l.sr * 1000 : 0
         masterOn = Pref.override != nil
+        helperInstalled = Helper.installed
+        helperOutdated  = Helper.outdated
         if !masterOn                        { health = .off }
         else if !isAirPlay                  { health = .notAirPlay }
-        else if Pref.override == nil        { health = .noOverride }
-        else if l.stream == expectedFrames  { health = .live }
+        else if l.stream == frames(wanted)  { health = .live }
         else                                { health = .pending }
+        if reselect != nil, health == .live || Date().timeIntervalSince(reselectSince) > 90 {
+            reselect = nil
+        }
+        // A speaker picked for the first time is saved at what it plays, provided
+        // that is what Preroll last applied. Not mid-switch, when the route about to
+        // drop is still up at the old value.
+        if health == .live, saved == nil, let n = routeName, n != forgotten,
+           reselect == nil, !busy, let o = Pref.override {
+            profiles[n] = o
+            note = "Saved \(n) at \(o) ms."
+        }
         if !busy, !userDirty {
-            target = Double(Pref.override ?? savedLatency)
+            target = Double(wanted)
         }
         sync()
     }
@@ -242,18 +469,105 @@ final class Model: ObservableObject {
         } else if keep.isRunning { keep.stop() }
     }
 
+    /// Sets (nil: removes) the override and restarts AirPlay. Through the helper
+    /// when it is installed, which needs no password, else through the prompt.
     func apply(_ ms: Int?) {
         busy = true; note = nil
-        DispatchQueue.main.async {
-            let err = Pref.apply(ms)
-            self.busy = false
-            self.userDirty = false
-            if let ms { UserDefaults.standard.set(ms, forKey: "savedLatency") }
-            self.note = err ?? (ms == nil
-                ? "Saved. Re-select your speakers when convenient to return to 2000 ms."
-                : "Saved. Re-select your speakers when convenient to activate \(ms!) ms.")
-            self.refresh()
-            self.sync()
+        let onAirPlay = isAirPlay
+        let speaker = routeName
+        let finish: (String?) -> Void = { [self] err in
+            busy = false
+            userDirty = false
+            if let err {
+                note = err
+            } else if let ms {
+                if onAirPlay {
+                    note = "Set to \(ms) ms. AirPlay restarted; select \(speaker ?? "your speakers") again."
+                    reselect = speaker ?? "speakers"; reselectSince = Date()
+                } else {
+                    note = "Set to \(ms) ms."
+                }
+            } else {
+                note = onAirPlay ? "Removed. Select your speakers again for 2000 ms." : "Removed."
+            }
+            refresh()
+        }
+        if Helper.installed {
+            DispatchQueue.global(qos: .userInitiated).async {
+                let e = Helper.send(ms)
+                DispatchQueue.main.async { finish(e) }
+            }
+        } else {
+            DispatchQueue.main.async { finish(Pref.apply(ms)) }
+        }
+    }
+
+    /// The Apply button. On a known speaker, saves the value as that speaker's and
+    /// restarts AirPlay only if it now runs the wrong latency. Otherwise the value
+    /// goes to whatever AirPlay route comes next; with no route up the restart
+    /// drops nothing.
+    func commit() {
+        let v = Int(target)
+        userDirty = false
+        if let n = routeName {
+            setProfile(n, v)
+            if masterOn && health == .live { note = "Saved for \(n)." }
+        } else {
+            fallbackLatency = v
+            if !masterOn || Pref.override != v || health == .pending { apply(v) }
+        }
+    }
+
+    /// Sets one speaker's latency from the list or the card. If that speaker is
+    /// playing and now runs the wrong latency, switches.
+    func setProfile(_ n: String, _ v: Int) {
+        profiles[n] = min(max(v, 100), 4000)
+        refresh()
+        if n == routeName && (!masterOn || health == .pending) { apply(profiles[n]) }
+    }
+
+    func removeProfile(_ n: String) {
+        profiles[n] = nil
+        if n == routeName { forgotten = n }
+        refresh()
+    }
+
+    /// A route change in the log. If the speaker just picked should run a different
+    /// latency from what AirPlay is running, switch: restart AirPlay, after which
+    /// the user picks the speaker once more. Only with the helper, since a password
+    /// dialog on every speaker change would be worse than the banner's button.
+    func routeChanged(_ uid: String) {
+        // The log line lands just after CoreAudio activates the device; let it settle.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [self] in
+            forgotten = nil
+            refresh()
+            guard autoSwitch, helperInstalled, masterOn, !busy,
+                  isAirPlay, deviceUID == uid, routeName != nil, health == .pending else { return }
+            // A switch to this same value moments ago did not take. Stop there rather
+            // than restart AirPlay on every pick; the banner keeps its button.
+            if let s = lastSwitch, s.ms == wanted, Date().timeIntervalSince(s.at) < 30 { return }
+            lastSwitch = (wanted, Date())
+            apply(wanted)
+        }
+    }
+
+    func installHelper() {
+        busy = true; note = nil
+        DispatchQueue.main.async { [self] in
+            let e = Helper.install()
+            busy = false
+            note = e ?? "Helper installed. Changes no longer ask for a password."
+            refresh()
+        }
+    }
+
+    func removeHelper() {
+        busy = true; note = nil
+        DispatchQueue.main.async { [self] in
+            let e = Helper.uninstall()
+            busy = false
+            note = e ?? "Helper removed."
+            refresh()
         }
     }
 }
@@ -313,7 +627,7 @@ struct Panel: View {
         switch m.health {
         case .off:        return "Inactive, macOS default 2000 ms"
         case .live:       return "Active"
-        case .pending:    return "Waiting for reconnect"
+        case .pending:    return "Needs switch"
         case .noOverride: return "Inactive, macOS default 2000 ms"
         case .notAirPlay: return "Not an AirPlay output"
         }
@@ -326,7 +640,7 @@ struct Panel: View {
             HStack(spacing: 9) {
                 Dot(health: m.health)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(m.deviceName).font(.system(size: 14, weight: .semibold)).lineLimit(1)
+                    Text(m.routeName ?? m.deviceName).font(.system(size: 14, weight: .semibold)).lineLimit(1)
                     Text(statusText).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Spacer(minLength: 6)
@@ -342,16 +656,17 @@ struct Panel: View {
                     Image(systemName: "arrow.triangle.2.circlepath")
                         .font(.system(size: 11)).foregroundStyle(.orange)
                     VStack(alignment: .leading, spacing: 1) {
-                        Text("Re-select your speakers for \(Pref.override ?? 0) ms")
+                        Text(m.routeName.map { "\($0) is set to \(m.wanted) ms, running \(m.streamMs)" }
+                             ?? "Running at \(m.streamMs) ms, set to \(m.wanted) ms")
                             .font(.system(size: 11, weight: .medium)).foregroundStyle(.orange)
-                        Text("The change applies when the AirPlay route is rebuilt")
+                            .lineLimit(1)
+                        Text("Switch restarts AirPlay; then select your speakers again")
                             .font(.system(size: 10)).foregroundStyle(.tertiary)
                     }
                     Spacer()
-                    Button("Sound…") {
-                        NSWorkspace.shared.open(URL(string:
-                            "x-apple.systempreferences:com.apple.Sound-Settings.extension")!)
-                    }.controlSize(.small)
+                    Button(m.busy ? "Switching…" : "Switch") {
+                        m.apply(m.wanted)
+                    }.controlSize(.small).disabled(m.busy)
                 }
                 .padding(9).frame(maxWidth: .infinity, alignment: .leading)
                 .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -371,7 +686,7 @@ struct Panel: View {
                         .font(.system(size: 14, weight: .semibold))
                     Text(m.masterOn
                          ? "Latency override is set and the stream is held open"
-                         : "Nothing applied. Turn on to use \(Int(m.target)) ms")
+                         : "Nothing applied. Turn on to use \(m.wanted) ms")
                         .font(.system(size: 10)).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -387,7 +702,8 @@ struct Panel: View {
             // ---- latency
             Card {
                 HStack(alignment: .firstTextBaseline) {
-                    Text("Target latency").font(.system(size: 13, weight: .medium))
+                    Text(m.routeName.map { "Latency for \($0)" } ?? "Latency")
+                        .font(.system(size: 13, weight: .medium)).lineLimit(1)
                     Spacer()
                     TextField("", value: Binding(
                         get: { Int(m.target) },
@@ -404,23 +720,86 @@ struct Panel: View {
                                       set: { m.target = $0; m.userDirty = true }),
                        in: 250...2000, step: 25)
                     .controlSize(.small)
-                Text("How far ahead audio is scheduled. Lower feels more responsive but leaves less buffer for Wi-Fi jitter, and dropouts are the failure mode. The sender reports a floor of 250 ms; type a value for anything off the slider.")
+                Text((m.routeName != nil
+                      ? "Saved for this speaker. "
+                      : "Goes to the next AirPlay speaker you pick. ")
+                     + "Lower feels more responsive but leaves less buffer for Wi-Fi jitter, and dropouts are the failure mode. The sender reports a floor of 250 ms; type a value for anything off the slider.")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 7) {
                     Button(m.busy ? "Applying…" : (m.masterOn ? "Apply" : "Apply and activate")) {
                         fieldFocused = false
-                        m.apply(Int(m.target))
+                        m.commit()
                     }
-                    .disabled(m.busy || (m.masterOn && Pref.override == Int(m.target)))
+                    .disabled(m.busy || (m.masterOn && m.health != .pending && Int(m.target) == m.wanted))
                     .controlSize(.regular)
-                    Text("Asks for your admin password")
+                    Text(m.helperInstalled ? "No password needed" : "Asks for your admin password")
                         .font(.system(size: 10)).foregroundStyle(.secondary)
                     Spacer()
                 }
                 if let n = m.note {
                     Text(n).font(.system(size: 11)).foregroundStyle(.secondary)
                         .lineLimit(3).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            // ---- speakers
+            Card {
+                Text("Speakers").font(.system(size: 13, weight: .medium))
+                if m.profiles.isEmpty {
+                    Text("Each speaker you pick is saved here at the latency it plays at. Change a value to give that speaker its own.")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    VStack(alignment: .leading, spacing: 5) {
+                        ForEach(m.profiles.keys.sorted(), id: \.self) { n in
+                            HStack(spacing: 6) {
+                                Text(n).font(.system(size: 12)).lineLimit(1)
+                                if n == m.routeName {
+                                    Image(systemName: "speaker.wave.2.fill")
+                                        .font(.system(size: 9)).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                TextField("", value: Binding(get: { m.profiles[n] ?? 0 },
+                                                             set: { m.setProfile(n, $0) }),
+                                          format: .number)
+                                    .textFieldStyle(.roundedBorder)
+                                    .multilineTextAlignment(.trailing)
+                                    .font(.system(size: 12, design: .rounded)).monospacedDigit()
+                                    .frame(width: 56).disabled(m.busy)
+                                Text("ms").font(.system(size: 11)).foregroundStyle(.secondary)
+                                Button { m.removeProfile(n) } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                }
+                                .buttonStyle(.plain).foregroundStyle(.tertiary).disabled(m.busy)
+                                .help("Remove \(n)")
+                            }
+                        }
+                    }
+                }
+                Row(title: "Switch automatically",
+                    detail: m.helperInstalled
+                        ? "When you pick a saved speaker whose latency differs from what is running, Preroll restarts AirPlay to apply it, and you pick the speaker once more."
+                        : "Installs a small root helper, once, so changes never ask for a password. That is what lets Preroll switch by itself when you pick a speaker.") {
+                    if m.helperInstalled {
+                        Toggle("", isOn: $m.autoSwitch).toggleStyle(.switch)
+                            .labelsHidden().controlSize(.small)
+                    } else {
+                        Button("Install…") { m.installHelper() }
+                            .controlSize(.small).disabled(m.busy)
+                    }
+                }
+                if m.helperInstalled {
+                    HStack {
+                        if m.helperOutdated {
+                            Button("Update helper…") { m.installHelper() }
+                                .controlSize(.small).disabled(m.busy)
+                        }
+                        Spacer()
+                        Button("Remove helper…") { m.removeHelper() }
+                            .buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(.secondary)
+                            .disabled(m.busy)
+                    }
                 }
             }
 
@@ -494,6 +873,13 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         host.sizingOptions = [.preferredContentSize]   // NSHostingController does NOT auto-size by default
         popover.contentViewController = host
 
+        model.names.onLive = { [weak self] uid in self?.model.routeChanged(uid) }
+        model.names.onBackfill = { [weak self] in self?.model.refresh(); self?.icon() }
+        model.names.start { [weak self] in
+            guard let m = self?.model, m.isAirPlay else { return "" }
+            return m.deviceUID
+        }
+
         model.refresh(); icon()
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.model.refresh(); self?.icon()
@@ -523,13 +909,19 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                ?? NSImage(systemSymbolName: "airplayaudio", accessibilityDescription: "Preroll")
         img?.isTemplate = true
         b.image = img
-        b.title = model.isAirPlay ? String(format: " %.0f", model.latencyMs) : ""
+        if let r = model.reselect {
+            b.title = " Select " + (r.count > 20 ? r.prefix(19) + "…" : r)
+        } else {
+            b.title = model.isAirPlay ? String(format: " %.0f", model.latencyMs) : ""
+        }
         // Last-resort guard: never leave the item with nothing to draw.
         if b.image == nil && b.title.isEmpty { b.title = "AP" }
         b.alphaValue = model.masterOn ? 1.0 : 0.55
         b.toolTip = model.masterOn
             ? "Preroll: active" : "Preroll: inactive"
     }
+
+    func applicationWillTerminate(_ n: Notification) { model.names.stop() }
 
     /// Closing the panel discards an unapplied edit, so reopening always shows
     /// the value that is actually live rather than a stale pending one.

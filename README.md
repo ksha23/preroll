@@ -44,24 +44,48 @@ and `aplat` on your PATH; a local build reaches them at
 
 1. Select your AirPlay speakers as the Mac's sound output.
 2. Click the menu bar icon.
-3. Set **Target latency** with the slider or by typing a value, then press
-   **Apply and activate**. You will be asked for an admin password once.
-4. Re-select your speakers when convenient. The change takes effect when the
-   AirPlay route is rebuilt.
+3. Set the latency with the slider or by typing a value, then press
+   **Apply and activate**. You will be asked for an admin password.
+4. Your AirPlay speakers disconnect. Re-select them and the new latency is
+   live.
 
 The dot turns green and the readout drops to your chosen value.
 
 **Active / Inactive** turns everything off and back on. Inactive removes the
-override entirely, so macOS returns to its stock 2000 ms.
+override entirely, so macOS returns to its stock 2000 ms. Both directions
+disconnect the speakers the same way.
+
+If the panel ever shows **Needs switch**, AirPlay is running a different value
+from the one the current speaker should have. Press **Switch** and re-select
+your speakers.
 
 Start at 350 ms. If audio stutters or drops out, raise it. Lower latency means
 less buffer to absorb Wi-Fi jitter, so the right value depends on your network.
 The sender reports a floor of 250 ms.
 
+### A latency per speaker
+
+The **Speakers** card is a list of every speaker you have used. The first time
+you pick a speaker, it is added at the latency it plays at. Change its value in
+the list, or with the latency card while it is playing, to give it its own; the
+× removes it. Speakers are known by the name you picked them as, so a stereo pair
+is one entry ("Desk Stereo Pair").
+
+macOS can only run one AirPlay latency at a time, and changing it means
+restarting AirPlay, which drops the route. So when you pick a saved speaker whose
+latency differs from what is running, Preroll switches, the speaker disconnects,
+and you pick it once more. The menu bar says which one.
+
+Switching by itself needs the **helper**: press **Install…** in the Speakers
+card and enter your password once. After that no change asks for a password.
+Without it, a mismatch shows a **Switch** button, and each switch asks.
+
 ## Uninstall
 
-Turn the master switch to **Inactive**, quit the app, and delete it from
-`/Applications`. That removes the preference and leaves nothing behind.
+Turn the master switch to **Inactive**. If you installed the helper, press
+**Remove helper…** in the Speakers card. Then quit the app and delete it from
+`/Applications`. That removes the preference and the helper and leaves nothing
+behind.
 
 ## License and trademarks
 
@@ -105,15 +129,22 @@ stream open. The generator is an xorshift that never returns zero, run at -78 dB
 ## Why it needs an admin password
 
 `AirPlayXPCHelper` reads the preference and runs as root, so the value has to live
-in a root-owned file. The app writes it once per change and does nothing else
-privileged. It never restarts services and never changes your audio output.
+in a root-owned file. Each change writes that file and restarts
+`AirPlayXPCHelper`, in one prompt, and does nothing else privileged.
+
+The optional Preroll helper does the same two things without the prompt. It is a
+short shell script (35 lines of code) that launchd runs as root when one request
+file changes. The request is a single number, which it checks against 100 to 4000
+ms before using, and only the user who installed the helper can write that file.
+Read it in `helper/`.
 
 ## Why you have to re-select your speakers
 
-The helper reads the preference when it builds an audio engine, which happens when
-an AirPlay route is established. Playing and pausing is not enough; the route has
-to be rebuilt. The app could force this by restarting the helper, but that would
-disconnect your speakers without asking, so it tells you instead.
+The helper builds one audio engine for system audio, on the first AirPlay route
+after it starts, and it starts at boot. Every route after that resumes the same
+engine at the latency it was created with, so re-selecting your speakers alone
+never picks up a change. The only way to get a new engine is to restart the
+helper, and restarting it drops the AirPlay route.
 
 ---
 
