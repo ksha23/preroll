@@ -11,6 +11,43 @@ Menu bar app plus a set of measurement tools. Tested on macOS 26.5.1, Apple
 Silicon, against a HomePod (2nd gen) stereo pair, a Sonos Era 100 SL, and an
 Apple TV 4K.
 
+## macOS 27
+
+On macOS 27 you probably do not need Preroll for HomePods.
+
+macOS 27 sends system audio to HomePods running HomePod OS 27 through a new
+buffered audio engine, over Wi-Fi Aware when it can. The AirPlay output device
+reports 9600 frames at 48 kHz, which is 200 ms, where macOS 26 reported 88200
+frames at 44.1 kHz. That is the reported figure. It has not been measured
+acoustically with `aplat` yet.
+
+Not every speaker gets the new engine. A Sonos Era 100 SL still gets the old
+one, at 2000 ms. The sender still reads `audioLatencyMs` on macOS 27, but the
+app has not been tested there, and its helper restart did not take effect in
+one test. Leave Preroll off on macOS 27 for now.
+
+### Stereo pairs that play one side
+
+On macOS 27.0.1 a HomePod stereo pair can play only one side from a Mac, even
+though both speakers light up. The same pair plays both sides from an iPhone.
+
+The cause is in the pair, not the Mac. Each speaker advertises a set of feature
+flags, and macOS 27 gives the new engine only to speakers that advertise feature
+bit 96. When one speaker of a pair lacks that bit, it gets the old engine, and
+macOS cannot mix the two engines in one pair. One speaker is left out, and the
+log says:
+
+    Cannot add subStream [...] with engineType=AudioEngineType_RTAudio
+      to stream [...] with engineType=AudioEngineType_Buffered
+
+To check your pairs:
+
+    ./pair-check.py
+
+If a pair shows a mismatch, restart both of its speakers and run it again. In
+the cases seen so far, a restart (or, once, a night of uptime) brought the
+missing bit back, with no software update. Details are in NOTES.md.
+
 ---
 
 ## Install
@@ -161,6 +198,7 @@ along with a LaunchAgent that runs the keep-alive without the menu bar app.
 | `apwatch.sh` | live AirPlay latency telemetry from the unified log |
 | `set-latency-pref.sh` | set any tunable from the shell and restart the helper |
 | `src/resolve.py` | resolves CFString operands at preference call sites in a Mach-O |
+| `pair-check.py` | flags stereo pairs whose speakers disagree on feature bit 96 (macOS 27) |
 
 To see the driver's own telemetry:
 

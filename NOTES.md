@@ -270,3 +270,80 @@ system-audio aggregate.
 The engine is built before that line is logged (engine at 01:06:07.211, name at
 01:06:08.265), so the name always arrives too late to set the latency of the
 route it names. That is why a switch costs one extra pick.
+
+## macOS 27
+
+Observed on macOS 27.0.1 (26A434), sender AirPlay 980.77.5, against HomePods on
+HomePod OS 27.0 (AirPlay 980.77.2), a Sonos Era 100 SL (366.0) and an Apple TV on
+tvOS 26.6. Every Preroll setting was removed and the Mac rebooted before these
+observations, so none of them involve Preroll.
+
+### A new engine
+
+macOS 26 used one realtime engine for system audio, `RTAE ['HLA']`, at 2000 ms.
+macOS 27 adds a buffered one. The two show up in the log as stream engine types:
+
+    engineType=AudioEngineType_RTAudio      the old realtime engine
+    engineType=AudioEngineType_Buffered     the new one, engineTypeBufferedRealTime in its options
+
+HomePods on OS 27 get the buffered engine, usually over Wi-Fi Aware (`NANDS`
+data sessions on `nan0` and `llw1`, "Activation succeeded over NAN"). The AirPlay
+output device then reports:
+
+    transport=airp  sr=48000  bufferFrames=128  streamLatency=9600     (200 ms)
+
+The Sonos and, at times, HomePods reached over the regular network get the old
+engine at 88200 frames, 2000 ms. The sender still reads the preference on 27:
+
+    [com.apple.airplay:APSLatency] Overriding audio latency: 400 ms
+
+### Stereo pairs and feature bit 96
+
+The engine type is chosen per speaker. A stereo pair's stream takes the type of
+the first route built after `AirPlayXPCHelper` starts, and a speaker whose type
+differs is refused:
+
+    Cannot add subStream [0x41EC] with engineType=AudioEngineType_RTAudio
+      to stream [0x23ED] with engineType=AudioEngineType_Buffered
+
+That speaker is activated, so it lights up, but it gets no audio. Picking a
+HomePod first leaves the buffered stream, and the old-engine speaker is silent.
+Picking the Sonos first leaves an old-engine stream, and the other speaker is
+silent. No order plays both.
+
+Which speaker gets which engine follows its advertised extended feature flags,
+the `fex` field of its `_airplay._tcp` Bonjour record (base64, little-endian):
+
+    speaker                 bit 96, day 1   bit 96, later
+    White HomePod Left      missing         present after a night of uptime
+    White HomePod Right     present         present
+    OG HomePod Left Back    missing         present after a restart
+    OG HomePod Right Back   present         present
+
+Every refused speaker was one missing bit 96, both pairs went to stereo once both
+halves had it, and no software version changed in between. What bit 96 means is
+not documented. The evidence is that correlation plus one confirmed prediction.
+`pair-check.py` reads the flags and flags a mismatched pair.
+
+### Crashes on 27.0.1, with no Preroll settings
+
+- `AirPlayXPCHelper` and `audiomxd` killed by the CoreMedia XPC watchdog
+  (`figXPC_ServerTimeout_Endpoint`, `figXPC_ServerTimeout_RoutingContext`). The
+  thread everything waited on was blocked in `APTNANDataSessionRetainActivation`,
+  opening a Wi-Fi Aware session to a stereo pair.
+- `AirPlayXPCHelper` SIGABRT, `-[NSMutableDictionary __addObject:forKey:]: object
+  cannot be nil` in `audioStream_resumeInternal`. Twice, both times in the Sonos
+  route's own stream, one to two seconds after it started.
+
+### Red herrings
+
+`coreaudiod` logs this at every start, yet AirPlay devices are created normally:
+
+    _XPCHelperCopyAirPlayPref:817: got error -6753/0xFFFFE59F kConnectionErr
+    HALS_UCPlugIn::Construct_New: couldn't create the IUnknown interface
+
+### Restarting
+
+`killall AirPlayXPCHelper` reported success once and left the same pid running.
+`killall -9` worked. `launchctl kickstart -k system/com.apple.audio.coreaudiod` is
+refused while SIP is on, so `killall -9 coreaudiod` is the way to restart it.
